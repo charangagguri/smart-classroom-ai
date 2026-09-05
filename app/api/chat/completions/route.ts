@@ -1,120 +1,65 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { streamText } from 'ai';
-import { createOpenAI } from '@ai-sdk/openai';
-import { randomUUID } from 'crypto';
+import { NextRequest, NextResponse } from "next/server";
+import { createOpenAI } from "@ai-sdk/openai";
+import { generateText } from "ai";
 
 type ChatBody = {
-  messages?: Array<{ role: string; content: unknown }>;
-  model?: string;
-  stream?: boolean;
-  [key: string]: unknown;
+  messages?: Array<{
+    role: "system" | "user" | "assistant";
+    content: string;
+  }>;
 };
 
-type ChatCompletionsDeps = {
-  createOpenAIClient: typeof createOpenAI;
-  streamTextImpl: typeof streamText;
-};
-
-/**
- * OpenAI-compatible Chat Completions endpoint backed by Vercel AI SDK.
- *
- * Agora's Conversational AI Engine calls this as its "custom LLM" — sending
- * standard OpenAI chat completion requests and expecting OpenAI SSE chunks back.
- *
- * Extension point: add RAG retrieval, tool calls, guards, etc. before/after
- * the streamText call.
- */
-export function createChatCompletionsHandler({
-  createOpenAIClient,
-  streamTextImpl,
-}: ChatCompletionsDeps) {
-  return async function POST(request: NextRequest) {
-    // ── Config ────────────────────────────────────────────────────────────────
+export async function POST(request: NextRequest) {
+  try {
     const apiKey = process.env.NEXT_LLM_API_KEY;
-    const llmUrl = process.env.NEXT_LLM_URL;
-    // Model is pinned here — change this to switch models without other config changes.
-    // Never use body.model; that would allow callers to route to arbitrary models.
-    const modelId = 'gpt-4o';
 
-    if (!apiKey || !llmUrl) {
+    if (!apiKey) {
       return NextResponse.json(
-        { error: 'NEXT_LLM_API_KEY and NEXT_LLM_URL must be set' },
-        { status: 500 },
+        { error: "NEXT_LLM_API_KEY is missing" },
+        { status: 500 }
       );
     }
 
-    // @ai-sdk/openai needs a base URL, not the full /chat/completions path
-    const baseURL = llmUrl.replace(/\/chat\/completions\/?$/, '');
+    const body: ChatBody = await request.json();
 
-    let body: ChatBody;
-
-    try {
-      body = await request.json();
-    } catch {
-      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
-    }
-
-    const openai = createOpenAIClient({ apiKey, baseURL });
-
-    const result = streamTextImpl({
-      // modelId is always sourced from the environment — body.model is ignored
-      model: openai(modelId),
-      messages: (body.messages ?? []) as NonNullable<
-        Parameters<typeof streamText>[0]['messages']
-      >,
+    const openai = createOpenAI({
+      apiKey: apiKey,
+      baseURL:
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
     });
 
-    const encoder = new TextEncoder();
-    const id = `chatcmpl-${randomUUID()}`;
-    const created = Math.floor(Date.now() / 1000);
-    const model = body.model ?? modelId;
+    const result = await generateText({
+      model: openai("gemini-2.5-flash"),
+      messages: body.messages ?? [],
+    });
 
-    const sseChunk = (
-      delta: Record<string, unknown>,
-      finishReason: string | null = null,
-    ) =>
-      encoder.encode(
-        `data: ${JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta, finish_reason: finishReason }],
-        })}\n\n`,
-      );
+    return NextResponse.json({
+      id: `chatcmpl-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "gemini-2.5-flash",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: result.text,
+          },
+          finish_reason: "stop",
+        },
+      ],
+    });
+  } catch (error) {
+    console.error("GEMINI ERROR:", error);
 
-    const stream = new ReadableStream({
-      async start(controller) {
-        try {
-          // Role-only first chunk (OpenAI convention)
-          controller.enqueue(sseChunk({ role: 'assistant', content: '' }));
-
-          for await (const chunk of result.textStream) {
-            controller.enqueue(sseChunk({ content: chunk }));
-          }
-
-          controller.enqueue(sseChunk({}, 'stop'));
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          controller.close();
-        } catch (err) {
-          console.error('[custom-llm] Stream error:', err);
-          controller.error(err);
-        }
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unknown server error",
       },
-    });
-
-    return new NextResponse(stream, {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-      },
-    });
-  };
+      { status: 500 }
+    );
+  }
 }
-
-export const POST = createChatCompletionsHandler({
-  createOpenAIClient: createOpenAI,
-  streamTextImpl: streamText,
-});
